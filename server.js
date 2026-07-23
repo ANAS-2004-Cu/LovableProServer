@@ -7,18 +7,90 @@ const crypto = require('crypto');
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(cors());
+
+// السماح للمتصفح برؤية الهيدر السري
+app.use(cors({
+    exposedHeaders: ['x-vibe-reply']
+}));
 app.use(express.json());
 
-// ─── مسارات سريعة جداً (لا تحتاج قاعدة بيانات) لضمان اتصال الإضافة ───
-app.get('/api/public/health', (req, res) => {
-    res.json({ status: "online", timestamp: Date.now() });
-});
+// ==========================================
+// 🛡️ منظومة التشفير (VibeCoding Dynamic Cipher)
+// ==========================================
+const KEY_A = Buffer.from('e1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2', 'hex');
+const KEY_B = Buffer.from('f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2e1f0', 'hex');
 
-app.get('/api/public/extension/version', (req, res) => {
-    res.json({ version: "1.0.0", mandatory: false, download_url: "#" });
-});
+// بوابة XNOR لاختيار المفتاح
+function getEncryptionKey(timestamp) {
+    const date = new Date(Number(timestamp));
+    const isMinEven = date.getUTCMinutes() % 2 === 0;
+    const isSecEven = date.getUTCSeconds() % 2 === 0;
+    // تطبيق XNOR: متشابهان = زوجي (A) / مختلفان = فردي (B)
+    return (isMinEven === isSecEven) ? KEY_A : KEY_B;
+}
 
+function encryptData(text, key) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const tag = cipher.getAuthTag().toString('hex');
+    return `${iv.toString('hex')}:${encrypted}:${tag}`;
+}
+
+function decryptData(encStr, key) {
+    const [ivHex, cipherHex, tagHex] = encStr.split(':');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+}
+
+// ميدل وير لفك التشفير وفحص الزمن
+const secureMiddleware = (req, res, next) => {
+    // نتخطى مسارات الفحص والواجهة ومسارات الأدمن
+    if (req.method === 'GET' || !req.path.startsWith('/api/public/license') && !req.path.startsWith('/api/public/trial')) {
+        return next();
+    }
+
+    const epoch = req.headers['x-vibe-epoch'];
+    if (!epoch) return res.status(401).json({ error: "Unauthorized" });
+
+    const now = Date.now();
+    const reqTime = Number(epoch);
+    const diff = now - reqTime;
+
+    // حماية ضد إعادة الإرسال: 3 دقائق (180,000 مللي ثانية)
+    if (diff > 180000 || diff < -5000) {
+        return res.status(401).json({ error: "Request Expired" });
+    }
+
+    try {
+        const key = getEncryptionKey(epoch);
+        const decryptedStr = decryptData(req.body.payload, key);
+        req.body = JSON.parse(decryptedStr);
+    } catch (e) {
+        return res.status(401).json({ error: "Tampered Payload" });
+    }
+
+    // تعديل استجابة السيرفر ليقوم بالتشفير التلقائي للبيانات الخارجة
+    const originalJson = res.json;
+    res.json = function(data) {
+        const replyEpoch = Date.now().toString();
+        const key = getEncryptionKey(replyEpoch);
+        const cipher = encryptData(JSON.stringify(data), key);
+        res.setHeader('x-vibe-reply', replyEpoch);
+        return originalJson.call(this, { payload: cipher });
+    };
+
+    next();
+};
+
+app.use(secureMiddleware);
+
+// ==========================================
+// باقي الكود كما هو من مسار /health للأسفل...
 // ─── الاتصال الآمن بقاعدة البيانات لبيئة Vercel ───
 let isConnected = false;
 const connectDB = async () => {
