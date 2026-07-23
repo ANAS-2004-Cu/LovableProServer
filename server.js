@@ -88,7 +88,18 @@ const secureMiddleware = (req, res, next) => {
 };
 
 app.use(secureMiddleware);
+// ─── مسارات الفحص والتحديثات (معفاة من التشفير) ───
+app.get('/api/public/health', (req, res) => {
+    res.json({ status: "online", timestamp: Date.now() });
+});
 
+app.get('/api/public/extension/version', (req, res) => {
+    res.json({ 
+        version: "1.0.0", 
+        mandatory: false, 
+        download_url: "#" 
+    });
+});
 // ==========================================
 // باقي الكود كما هو من مسار /health للأسفل...
 // ─── الاتصال الآمن بقاعدة البيانات لبيئة Vercel ───
