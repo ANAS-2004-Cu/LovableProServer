@@ -181,7 +181,7 @@ app.post('/api/admin/delete-trial', async (req, res) => {
     }
 });
 
-// ─── 3. خوارزمية التطابق وتسجيل السجلات ───
+// --- 3. خوارزمية التطابق وتسجيل السجلات ---
 function calculateDeviceScore(incomingComps, storedComps) {
     if (!incomingComps || !storedComps) return 0;
     let score = 0;
@@ -208,9 +208,12 @@ async function findOrCreateDevice(device_hash, components, incomingCount) {
     if (device) {
         device.usage_count = Math.max(device.usage_count || 0, incomingCount);
         device.last_used_at = new Date();
-        device.components = components; 
+        // تحديث البصمة فقط إذا كانت غير فارغة (لمنع مسح البصمة الحقيقية)
+        if (components && Object.keys(components).length > 0) {
+            device.components = components; 
+        }
     } else {
-        device = new Device({ device_hash, components, usage_count: incomingCount });
+        device = new Device({ device_hash, components: components || {}, usage_count: incomingCount });
     }
     await device.save();
     return device;
@@ -312,52 +315,75 @@ app.post('/api/public/trial/auto-license', limiter, async (req, res) => {
         if (!device_hash) return res.json({ ok: false, reason: "missing_device" });
 
         const incomingCount = Number(usage_count) || 0;
-        const allTrials = await Trial.find();
-        
-        for (const storedTrial of allTrials) {
-            const score = calculateDeviceScore(components, storedTrial.components);
-            if (score >= 75) {
-                storedTrial.usage_count = Math.max(storedTrial.usage_count || 0, incomingCount);
-                storedTrial.last_used_at = new Date();
-                await storedTrial.save();
+        const trialKey = `LEP-TRIAL-${device_hash.slice(0,8)}`;
 
-                const remaining = 1800000 - (Date.now() - storedTrial.started_at.getTime());
-                if (remaining <= 0 || storedTrial.status === 'expired') {
-                    storedTrial.status = 'expired';
-                    await storedTrial.save();
-                    return res.json({ ok: false, detail: "لقد استهلكت الفترة التجريبية لهذا الجهاز مسبقاً." });
+        // 1. البحث بالتطابق الحرفي للمعرف أولاً (يمنع خطأ Duplicate Key)
+        let storedTrial = await Trial.findOne({ device_hash: device_hash });
+
+        // 2. إذا لم يجد تطابق حرفي، يستخدم خوارزمية التقارب (Fuzzy Match)
+        if (!storedTrial) {
+            const allTrials = await Trial.find();
+            for (const t of allTrials) {
+                if (calculateDeviceScore(components, t.components) >= 75) {
+                    storedTrial = t;
+                    break;
                 }
-
-                return res.json({
-                    ok: true,
-                    license_key: `LEP-TRIAL-${storedTrial.device_hash.slice(0,8)}`,
-                    plan: "تجربة مجانية (30 دقيقة)",
-                    started_at: storedTrial.started_at.toISOString(),
-                    expires_at: new Date(storedTrial.started_at.getTime() + 1800000).toISOString(),
-                    usage_count: storedTrial.usage_count
-                });
             }
         }
 
-        const newTrial = new Trial({
-            device_hash: device_hash,
-            components: components,
-            usage_count: incomingCount,
-            started_at: new Date(),
-            last_used_at: new Date()
-        });
-        await newTrial.save();
+        // 3. معالجة التجربة (سواء كانت موجودة أو جديدة)
+        if (storedTrial) {
+            storedTrial.usage_count = Math.max(storedTrial.usage_count || 0, incomingCount);
+            storedTrial.last_used_at = new Date();
+            await storedTrial.save();
 
-        res.json({
-            ok: true,
-            license_key: `LEP-TRIAL-${device_hash.slice(0,8)}`,
-            plan: "تجربة مجانية (30 دقيقة)",
-            started_at: newTrial.started_at.toISOString(),
-            expires_at: new Date(newTrial.started_at.getTime() + 1800000).toISOString(),
-            usage_count: newTrial.usage_count
-        });
+            const remaining = 1800000 - (Date.now() - storedTrial.started_at.getTime());
+            if (remaining <= 0 || storedTrial.status === 'expired') {
+                storedTrial.status = 'expired';
+                await storedTrial.save();
+                return res.json({ ok: false, detail: "لقد استهلكت الفترة التجريبية لهذا الجهاز مسبقاً." });
+            }
 
+            // التعديل: تسجيل الجهاز في قائمة المستخدمين 
+            let device = await findOrCreateDevice(storedTrial.device_hash, storedTrial.components, incomingCount);
+            device.current_key = trialKey;
+            await device.save();
+
+            return res.json({
+                ok: true,
+                license_key: trialKey,
+                plan: "تجربة مجانية (30 دقيقة)",
+                started_at: storedTrial.started_at.toISOString(),
+                expires_at: new Date(storedTrial.started_at.getTime() + 1800000).toISOString(),
+                usage_count: storedTrial.usage_count
+            });
+        } else {
+            // إنشاء تجربة جديدة كلياً
+            const newTrial = new Trial({
+                device_hash: device_hash,
+                components: components || {},
+                usage_count: incomingCount,
+                started_at: new Date(),
+                last_used_at: new Date()
+            });
+            await newTrial.save();
+
+            // التعديل: تسجيل الجهاز في قائمة المستخدمين
+            let device = await findOrCreateDevice(device_hash, components, incomingCount);
+            device.current_key = trialKey;
+            await device.save();
+
+            res.json({
+                ok: true,
+                license_key: trialKey,
+                plan: "تجربة مجانية (30 دقيقة)",
+                started_at: newTrial.started_at.toISOString(),
+                expires_at: new Date(newTrial.started_at.getTime() + 1800000).toISOString(),
+                usage_count: newTrial.usage_count
+            });
+        }
     } catch (error) {
+        console.error("Trial Error:", error);
         res.json({ ok: false, reason: "server_error" });
     }
 });
