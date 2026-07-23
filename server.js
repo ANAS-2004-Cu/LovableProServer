@@ -10,18 +10,33 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
+// ─── الاتصال الآمن بقاعدة البيانات لبيئة Vercel (Serverless) ───
+let isConnected = false;
+const connectDB = async () => {
+    if (isConnected) return;
+    try {
+        const MONGO_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/lovable_pro';
+        await mongoose.connect(MONGO_URI);
+        isConnected = true;
+        console.log('✅ Connected to MongoDB Database');
+    } catch (err) {
+        console.error('❌ MongoDB Connection Error:', err);
+    }
+};
+
+// Middleware لضمان الاتصال بقاعدة البيانات قبل تنفيذ أي طلب
+app.use(async (req, res, next) => {
+    await connectDB();
+    next();
+});
+
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
     max: 20, 
     message: { valid: false, reason: "rate_limit", detail: "محاولات كثيرة جداً، يرجى المحاولة بعد 15 دقيقة." }
 });
 
-const MONGO_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/lovable_pro';
-mongoose.connect(MONGO_URI)
-    .then(() => console.log('✅ Connected to MongoDB Database'))
-    .catch(err => console.error('❌ MongoDB Connection Error:', err));
-
-// ─── 1. الجداول (Schemas) الجديدة ───
+// ─── 1. الجداول (Schemas) ───
 
 // أ. جدول التراخيص
 const licenseSchema = new mongoose.Schema({
@@ -76,7 +91,6 @@ app.post('/api/admin/generate', async (req, res) => {
     }
 });
 
-// جلب الإحصائيات مع الحساب الديناميكي للمدة المتبقية والأجهزة المتصلة
 app.get('/api/admin/stats', async (req, res) => {
     try {
         const licenses = await License.find().sort({ _id: -1 }).lean();
@@ -86,12 +100,8 @@ app.get('/api/admin/stats', async (req, res) => {
         const totalLicenseUsage = licenses.reduce((sum, l) => sum + (l.usage_count || 0), 0);
         const totalTrialUsage = trials.reduce((sum, t) => sum + (t.usage_count || 0), 0);
 
-        // تجهيز بيانات التراخيص للعرض
         const enrichedLicenses = licenses.map(lic => {
-            // حساب الأجهزة المتصلة بهذا الكود
             const connectedDevices = devices.filter(d => d.current_key === lic.key).length;
-            
-            // حساب المدة المتبقية ديناميكياً
             let remaining = "—";
             if (lic.status === 'active' && lic.expires_at) {
                 const msLeft = new Date(lic.expires_at).getTime() - Date.now();
@@ -103,7 +113,6 @@ app.get('/api/admin/stats', async (req, res) => {
                     remaining = "منتهي";
                 }
             }
-
             return { ...lic, connected_devices: connectedDevices, time_left: remaining };
         });
 
@@ -115,6 +124,7 @@ app.get('/api/admin/stats', async (req, res) => {
             trials: trials 
         });
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: "حدث خطأ في جلب الإحصائيات" });
     }
 });
@@ -124,7 +134,6 @@ app.post('/api/admin/reset-device', async (req, res) => {
         const { key } = req.body;
         const lic = await License.findOne({ key });
         if (lic) {
-            // فك الارتباط من جدول الأجهزة
             await Device.updateMany({ current_key: key }, { $set: { current_key: null } });
             lic.status = 'unused';
             await lic.save();
@@ -137,7 +146,7 @@ app.post('/api/admin/reset-device', async (req, res) => {
     }
 });
 
-// ─── 3. خوارزمية التطابق المرن (Fuzzy Matching Logic) ───
+// ─── 3. خوارزمية التطابق المرن ───
 function calculateDeviceScore(incomingComps, storedComps) {
     if (!incomingComps || !storedComps) return 0;
     let score = 0;
@@ -152,7 +161,6 @@ function calculateDeviceScore(incomingComps, storedComps) {
 async function findOrCreateDevice(device_hash, components, incomingCount) {
     let device = await Device.findOne({ device_hash });
     if (!device) {
-        // بحث مرن عن جهاز يشبهه
         const allDevices = await Device.find();
         for (const d of allDevices) {
             if (calculateDeviceScore(components, d.components) >= 75) {
@@ -163,9 +171,9 @@ async function findOrCreateDevice(device_hash, components, incomingCount) {
     }
     
     if (device) {
-        device.usage_count = Math.max(device.usage_count, incomingCount);
+        device.usage_count = Math.max(device.usage_count || 0, incomingCount);
         device.last_used_at = new Date();
-        device.components = components; // تحديث البصمة باستمرار
+        device.components = components; 
     } else {
         device = new Device({ device_hash, components, usage_count: incomingCount });
     }
@@ -173,9 +181,7 @@ async function findOrCreateDevice(device_hash, components, incomingCount) {
     return device;
 }
 
-// ─── 4. الروابط العامة (APIs) ───
-
-// مسار الفحص المخصص لحل مشكلة Vercel Cache
+// ─── 4. الروابط العامة ───
 app.get('/api/public/health', (req, res) => {
     res.json({ status: "online", timestamp: Date.now() });
 });
@@ -186,14 +192,11 @@ app.post('/api/public/license/validate', limiter, async (req, res) => {
         const key = String(license_key || "").trim().toUpperCase();
         const incomingCount = Number(usage_count) || 0;
 
-        // معالجة الجهاز
         let device = await findOrCreateDevice(device_hash, components, incomingCount);
-
         const lic = await License.findOne({ key: key });
 
         if (lic) {
-            // تحديث إجمالي استخدام الكود
-            lic.usage_count = Math.max(lic.usage_count, incomingCount);
+            lic.usage_count = Math.max(lic.usage_count || 0, incomingCount);
 
             if (lic.status === 'unused') {
                 lic.status = 'active';
@@ -212,7 +215,6 @@ app.post('/api/public/license/validate', limiter, async (req, res) => {
                     return res.json({ valid: false, reason: "expired", detail: "انتهى اشتراكك." });
                 }
                 
-                // التأكد من أن هذا الجهاز يملك الكود، أو أن الكود ليس مربوطاً بجهاز آخر بنسبة قوية
                 if (device.current_key !== key) {
                     const existingDevice = await Device.findOne({ current_key: key });
                     if (existingDevice && existingDevice._id.toString() !== device._id.toString()) {
@@ -236,10 +238,9 @@ app.post('/api/public/license/validate', limiter, async (req, res) => {
             });
         }
 
-        // Fallback للـ Trials
         const trial = await Trial.findOne({ device_hash: device.device_hash });
         if (trial) {
-            trial.usage_count = Math.max(trial.usage_count, incomingCount);
+            trial.usage_count = Math.max(trial.usage_count || 0, incomingCount);
             trial.last_used_at = new Date();
             await trial.save();
 
@@ -260,6 +261,7 @@ app.post('/api/public/license/validate', limiter, async (req, res) => {
         res.json({ valid: false, reason: "not_found" });
 
     } catch (error) {
+        console.error(error);
         res.json({ valid: false, reason: "server_error" });
     }
 });
@@ -275,7 +277,7 @@ app.post('/api/public/trial/auto-license', limiter, async (req, res) => {
         for (const storedTrial of allTrials) {
             const score = calculateDeviceScore(components, storedTrial.components);
             if (score >= 75) {
-                storedTrial.usage_count = Math.max(storedTrial.usage_count, incomingCount);
+                storedTrial.usage_count = Math.max(storedTrial.usage_count || 0, incomingCount);
                 storedTrial.last_used_at = new Date();
                 await storedTrial.save();
 
@@ -316,8 +318,14 @@ app.post('/api/public/trial/auto-license', limiter, async (req, res) => {
         });
 
     } catch (error) {
+        console.error(error);
         res.json({ ok: false, reason: "server_error" });
     }
+});
+
+// ─── 5. الروابط التي تم إرجاعها للإضافة ───
+app.get('/api/public/extension/version', (req, res) => {
+    res.json({ version: "1.0.0", mandatory: false, download_url: "#" });
 });
 
 function generateTypeID(prefix) {
