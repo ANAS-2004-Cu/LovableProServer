@@ -10,7 +10,16 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
-// ─── الاتصال الآمن بقاعدة البيانات لبيئة Vercel (Serverless) ───
+// ─── مسارات سريعة جداً (لا تحتاج قاعدة بيانات) لضمان اتصال الإضافة ───
+app.get('/api/public/health', (req, res) => {
+    res.json({ status: "online", timestamp: Date.now() });
+});
+
+app.get('/api/public/extension/version', (req, res) => {
+    res.json({ version: "1.0.0", mandatory: false, download_url: "#" });
+});
+
+// ─── الاتصال الآمن بقاعدة البيانات لبيئة Vercel ───
 let isConnected = false;
 const connectDB = async () => {
     if (isConnected) return;
@@ -24,7 +33,6 @@ const connectDB = async () => {
     }
 };
 
-// Middleware لضمان الاتصال بقاعدة البيانات قبل تنفيذ أي طلب
 app.use(async (req, res, next) => {
     await connectDB();
     next();
@@ -36,36 +44,35 @@ const limiter = rateLimit({
     message: { valid: false, reason: "rate_limit", detail: "محاولات كثيرة جداً، يرجى المحاولة بعد 15 دقيقة." }
 });
 
-// ─── 1. الجداول (Schemas) ───
+// ─── 1. الجداول (Schemas) مع سجلات الـ History ───
 
-// أ. جدول التراخيص
 const licenseSchema = new mongoose.Schema({
     key: { type: String, required: true, unique: true },
     plan: { type: String, required: true },
     durationDays: { type: Number, required: true },
-    status: { type: String, default: 'unused' }, // unused, active, expired
+    status: { type: String, default: 'unused' }, 
     started_at: { type: Date, default: null },
     expires_at: { type: Date, default: null },
-    usage_count: { type: Number, default: 0 } // إجمالي الاستخدام لهذا الكود
+    usage_count: { type: Number, default: 0 },
+    history_devices: { type: Array, default: [] } // سجل الأجهزة التي استخدمت هذا الكود
 });
 const License = mongoose.model('License', licenseSchema);
 
-// ب. جدول المستخدمين (الأجهزة)
 const deviceSchema = new mongoose.Schema({
     device_hash: { type: String, required: true, unique: true },
     components: { type: Object, required: true },
-    current_key: { type: String, default: null }, // الكود المربوط حالياً
+    current_key: { type: String, default: null }, 
     status: { type: String, default: 'active' },
-    usage_count: { type: Number, default: 0 }, // عداد المستخدم
-    last_used_at: { type: Date, default: Date.now }
+    usage_count: { type: Number, default: 0 }, 
+    last_used_at: { type: Date, default: Date.now },
+    history_keys: { type: Array, default: [] } // سجل الأكواد التي استخدمها هذا الجهاز
 });
 const Device = mongoose.model('Device', deviceSchema);
 
-// ج. جدول الفترات التجريبية
 const trialSchema = new mongoose.Schema({
     device_hash: { type: String, required: true, unique: true },
     components: { type: Object, required: true },
-    status: { type: String, default: 'active' }, // active, expired
+    status: { type: String, default: 'active' }, 
     usage_count: { type: Number, default: 0 },
     started_at: { type: Date, default: Date.now },
     last_used_at: { type: Date, default: Date.now },
@@ -75,17 +82,21 @@ const Trial = mongoose.model('Trial', trialSchema);
 
 // ─── 2. مسارات لوحة التحكم (Admin APIs) ───
 
+// التوليد المنطقي الجديد (يعتمد على الخطة فقط)
 app.post('/api/admin/generate', async (req, res) => {
     try {
-        const { plan, durationDays, count } = req.body;
-        const keys = [];
-        for (let i = 0; i < (count || 1); i++) {
-            const randomPart = crypto.randomBytes(4).toString('hex').toUpperCase();
-            const key = `LEP-${plan.toUpperCase()}-${randomPart}`;
-            await new License({ key, plan, durationDays }).save();
-            keys.push(key);
-        }
-        res.json({ success: true, keys });
+        const { plan } = req.body;
+        let durationDays = 30;
+        if (plan === 'Daily') durationDays = 1;
+        else if (plan === 'Weekly') durationDays = 7;
+        else if (plan === 'Monthly') durationDays = 30;
+        else if (plan === 'Yearly') durationDays = 365;
+
+        const randomPart = crypto.randomBytes(4).toString('hex').toUpperCase();
+        const key = `LEP-${plan.toUpperCase()}-${randomPart}`;
+        await new License({ key, plan, durationDays }).save();
+        
+        res.json({ success: true, key });
     } catch (err) {
         res.status(500).json({ error: "حدث خطأ في توليد الأكواد" });
     }
@@ -94,7 +105,7 @@ app.post('/api/admin/generate', async (req, res) => {
 app.get('/api/admin/stats', async (req, res) => {
     try {
         const licenses = await License.find().sort({ _id: -1 }).lean();
-        const devices = await Device.find().lean();
+        const devices = await Device.find().sort({ last_used_at: -1 }).lean();
         const trials = await Trial.find().sort({ started_at: -1 }).lean();
 
         const totalLicenseUsage = licenses.reduce((sum, l) => sum + (l.usage_count || 0), 0);
@@ -129,6 +140,7 @@ app.get('/api/admin/stats', async (req, res) => {
     }
 });
 
+// فك ارتباط كود
 app.post('/api/admin/reset-device', async (req, res) => {
     try {
         const { key } = req.body;
@@ -137,7 +149,7 @@ app.post('/api/admin/reset-device', async (req, res) => {
             await Device.updateMany({ current_key: key }, { $set: { current_key: null } });
             lic.status = 'unused';
             await lic.save();
-            res.json({ success: true, message: "تم فك ارتباط الأجهزة وإعادة الكود كجديد" });
+            res.json({ success: true });
         } else {
             res.status(404).json({ error: "الكود غير موجود" });
         }
@@ -146,7 +158,30 @@ app.post('/api/admin/reset-device', async (req, res) => {
     }
 });
 
-// ─── 3. خوارزمية التطابق المرن ───
+// حذف كود نهائياً
+app.post('/api/admin/delete-license', async (req, res) => {
+    try {
+        const { key } = req.body;
+        await License.deleteOne({ key });
+        await Device.updateMany({ current_key: key }, { $set: { current_key: null } });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "حدث خطأ" });
+    }
+});
+
+// حذف فترة تجريبية نهائياً
+app.post('/api/admin/delete-trial', async (req, res) => {
+    try {
+        const { device_hash } = req.body;
+        await Trial.deleteOne({ device_hash });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "حدث خطأ" });
+    }
+});
+
+// ─── 3. خوارزمية التطابق وتسجيل السجلات ───
 function calculateDeviceScore(incomingComps, storedComps) {
     if (!incomingComps || !storedComps) return 0;
     let score = 0;
@@ -181,11 +216,7 @@ async function findOrCreateDevice(device_hash, components, incomingCount) {
     return device;
 }
 
-// ─── 4. الروابط العامة ───
-app.get('/api/public/health', (req, res) => {
-    res.json({ status: "online", timestamp: Date.now() });
-});
-
+// ─── 4. الروابط العامة للمستخدمين ───
 app.post('/api/public/license/validate', limiter, async (req, res) => {
     try {
         const { license_key, device_hash, components, usage_count } = req.body;
@@ -197,6 +228,14 @@ app.post('/api/public/license/validate', limiter, async (req, res) => {
 
         if (lic) {
             lic.usage_count = Math.max(lic.usage_count || 0, incomingCount);
+
+            // إضافة السجلات (History)
+            if (!device.history_keys.some(h => h.key === key)) {
+                device.history_keys.push({ key, used_at: new Date() });
+            }
+            if (!lic.history_devices.some(h => h.device_hash === device.device_hash)) {
+                lic.history_devices.push({ device_hash: device.device_hash, used_at: new Date() });
+            }
 
             if (lic.status === 'unused') {
                 lic.status = 'active';
@@ -228,6 +267,7 @@ app.post('/api/public/license/validate', limiter, async (req, res) => {
             }
 
             await lic.save();
+            await device.save();
 
             return res.json({
                 valid: true,
@@ -318,16 +358,11 @@ app.post('/api/public/trial/auto-license', limiter, async (req, res) => {
         });
 
     } catch (error) {
-        console.error(error);
         res.json({ ok: false, reason: "server_error" });
     }
 });
 
-// ─── 5. الروابط التي تم إرجاعها للإضافة ───
-app.get('/api/public/extension/version', (req, res) => {
-    res.json({ version: "1.0.0", mandatory: false, download_url: "#" });
-});
-
+// ─── 5. دوال الحقن ───
 function generateTypeID(prefix) {
     const alphabet = "0123456789abcdefghjkmnpqrstvwxyz";
     let suffix = "01";
