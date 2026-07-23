@@ -39,8 +39,8 @@ app.use(async (req, res, next) => {
 });
 
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, 
-    max: 20, 
+    windowMs: 5 * 60 * 1000, 
+    max: 25,
     message: { valid: false, reason: "rate_limit", detail: "محاولات كثيرة جداً، يرجى المحاولة بعد 15 دقيقة." }
 });
 
