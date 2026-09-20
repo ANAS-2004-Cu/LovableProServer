@@ -480,18 +480,30 @@ function generateTypeID(prefix) {
 }
 
 function buildFixErrorFields(prompt) {
-    const buildEventId = `main:agent#01${Date.now()}#bld:${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+    // تحديث صيغة رقم الـ build_event_id لتكون مطابقة للنمط الجديد
+    const randomNum = Math.floor(Math.random() * 10000000000).toString().padStart(14, '0');
+    const buildEventId = `main:agent#${randomNum}#bld:${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+
     return {
-        id: generateTypeID("umsg"),
-        ai_message_id: generateTypeID("aimsg"),
+        // تم إزالة توليد id و ai_message_id الوهمية من هنا لأن الموقع أصبح يتحقق من صحتها (TypeID/UUIDv7)
+        // سنعتمد على المعرفات الأصلية التي يولدها المتصفح بشكل سليم
         message: `For the code present, I get the error below.\n\nPlease think step-by-step in order to resolve it.\n\`\`\`\n${prompt}\n\`\`\`\n`,
         intent: "fix_error",
         contains_error: true,
         error_ids: [buildEventId],
         error_source: "build_errors",
         message_intent_metadata: {
-            fix_error_metadata: { errors: [{ error_type: "build", error_message: prompt, build_event_id: buildEventId }] }
-        }
+            fix_error_metadata: { 
+                errors: [{ 
+                    error_type: "build", 
+                    error_message: prompt, 
+                    build_event_id: buildEventId 
+                }] 
+            }
+        },
+        // إضافة الحقول الجديدة المطلوبة للنجاح
+        chat_only: false,
+        model: null
     };
 }
 
