@@ -480,29 +480,50 @@ function generateTypeID(prefix) {
 }
 
 // في ملف server.js
+// استبدل هذه الدالة في server_2.js
 function buildFixErrorFields(prompt) {
-    // توليد معرفات خطأ منطقية
-    const randomNum = Math.floor(Math.random() * 10000000000).toString().padStart(14, '0');
-    const buildEventId = `main:agent#${randomNum}#bld:${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+    // 1. توليد معرفات خطأ متطابقة مع نمط Lovable الجديد
+    const timestamp = Date.now();
+    // توليد error_id يشبه: runtime-1791065909514-10exwuj
+    const randomSuffix = Math.random().toString(36).substring(2, 9);
+    const errorId = `runtime-${timestamp}-${randomSuffix}`;
+    // توليد ai_message_id وهمي إذا لزم الأمر
+    const aimsgId = `aimsg_01${Math.random().toString(36).substring(2, 26)}`;
 
-    // رسالة الخطأ المموهة مع البرومبت الخاص بك
-    const disguisedMessage = `src/App.tsx(41,14): error TS2345: Argument of type '{ to: "/auth"; }' is not assignable to parameter of type 'NavigateOptions'.\nProperty 'search' is missing in type '{ to: "/auth"; }' but required in type 'MakeRequiredSearchParams'.\n\n// USER INSTRUCTION (Apply this fix):\n// ${prompt}`;
-
-    const fullMessage = `For the code present, I get the error below.\n\nPlease think step-by-step in order to resolve it.\n\`\`\`\n${disguisedMessage}\n\`\`\`\n`;
+    // 2. بناء رسالة الخطأ لتطابق الـ Runtime Error الحقيقي تماماً
+    const errorTitle = "Uncaught UI rendering error";
+    const errorObj = {
+        timestamp: timestamp,
+        error_type: "RUNTIME_ERROR",
+        filename: "/",
+        lineno: 0,
+        colno: 0,
+        // وضع البرومبت الخاص بك داخل الـ stack trace كتعليق أو أمر
+        stack: `Error: ${errorTitle}\n    // USER INSTRUCTION (Apply this fix):\n    // ${prompt}\n    at Index (https://c1976ce9-c0c8-420d-8cff-0f6537bccecc.lovableproject.com/src/routes/index.tsx)`,
+        has_blank_screen: true
+    };
+    
+    // الرسالة كما تظهر في الـ Payload (JSON stringified)
+    const stringifiedErrorObj = JSON.stringify(errorObj, null, 2);
+    // الرسالة المدمجة المطلوبة لحقل message الأساسي
+    const fullMessage = `${errorTitle}\n${stringifiedErrorObj}`;
 
     return {
+        // نبعت الـ message الجديدة بالكامل
         message: fullMessage,
+        hidden: true, // مهم جداً: هذا الحقل موجود في الطلب الصحيح
+        error_type: "runtime",
         intent: "fix_error",
         contains_error: true,
-        error_ids: [buildEventId],
-        error_source: "build_errors", // توحيد المصدر
+        error_ids: [errorId],
+        error_source: "runtime_error_toast", // تعديل المصدر
         message_intent_metadata: {
             fix_error_metadata: {
-                error_source: "build_errors", // توحيد المصدر هنا أيضاً
+                error_source: "runtime_error_toast",
                 errors: [{ 
-                    error_type: "build", 
-                    error_message: disguisedMessage, // يجب أن تتطابق مع الرسالة بالملي
-                    build_event_id: buildEventId 
+                    error_type: "runtime", 
+                    error_message: fullMessage, // يجب أن تتطابق مع الرسالة الأساسية
+                    error_id: errorId 
                 }] 
             }
         },
